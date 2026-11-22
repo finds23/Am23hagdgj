@@ -4,6 +4,7 @@
  *        -> iframe https://animed23.online/container.php?id=<ID>
  *        -> container.php?id=<ID>&open=1 (pantalla de idiomas) -> &lang=LAT|SUB|... (botones data-player-url)
  *        -> extractor por servidor.
+ * Slugs: ver baseSlugsOf/episodeSlugs (AniList da el titulo romaji y el del arco; /?s= y la pagina de la serie son el respaldo).
  * Idiomas vistos: SUB, LAT, CAST. Servidores vistos en LAT/CAST: Byse, Omega (mp4 en archive.org), MEGA, Epsilon, Abyss.
  * En SUB: Byse, Omega, MEGA, OK (ok.ru), Abyss. Nota: en SUB el Omega esta roto en la propia pagina del sitio (da 403), no es fallo del plugin.
  */
@@ -20,16 +21,17 @@ var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36
 // Activa/desactiva servidores. Nada de esto se ha probado todavia contra el sitio real.
 var ENABLED_SOURCES = {
   Omega: true,     // mp4 directo en archive.org; PROBADO: reproduce (LAT). En SUB esta roto en el sitio
-  Okru: true,      // ok.ru (solo en SUB); extractor portado de animejara.js, sin probar
-  Epsilon: false,  // peeplayer.com: sin extractor. Con DEBUG se vuelca su HTML para investigarlo
-  Abyss: false,    // abyssplayer.com: sin extractor. Con DEBUG se vuelca su HTML para ver si responde con cabeceras de navegador
+  Okru: true,      // ok.ru (solo en SUB); PROBADO: reproduce
+  Epsilon: false,  // sin extractor. peeplayer.com cifra los segmentos en el navegador (intercambio de claves /kx + AES-CBC por segmento): no hay .m3u8 usable. En algunos animes es ytplay.rpmvid.com (/api/public/resolve?file1=...), sin investigar
+  Abyss: false,    // abyssplayer.com: la pagina abre bien, pero el campo "media" del JSON base64 va cifrado y lo descifra core.bundle.js (no visto)
   Byse: false,     // bysesukior.com: descartado (antibot)
   MEGA: false      // mega.nz: cifrado en el cliente, no sirve para un plugin
 };
 // Servidores sin extractor cuyo HTML se vuelca en pantalla cuando DEBUG esta activo
-var DUMP_SOURCES = { Epsilon: true, Abyss: true };
+// Epsilon solo se vuelca si NO es peeplayer.com (ese ya se conoce)
+var DUMP_SOURCES = { Epsilon: true, Abyss: false };
 
-var VERSION = "1.0.1"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.0.2"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true; // TEMPORAL: muestra el diagnostico. Poner en false cuando todo funcione.
 var DUMP_MAX = 30000; // maximo de caracteres por volcado
 var TRACE = [];
@@ -95,8 +97,7 @@ async function fetchPage(url, headers) {
 }
 
 // ---------- TMDB ----------
-var ASIAN_COUNTRIES = ["JP", "CN", "KR", "TW", "HK"];
-async function getTMDBInfo(tmdbId) {
+async function getTMDBInfo(tmdbId, season) {
   var base = "https://api.themoviedb.org/3/tv/" + tmdbId + "?api_key=" + TMDB_API_KEY;
   var langs = ["en-US", "es-MX"];
   var titles = [];
@@ -113,7 +114,18 @@ async function getTMDBInfo(tmdbId) {
   // Solo titulos con letras latinas sirven para armar slugs
   var latin = titles.filter(function (t) { return slugify(t).length >= 2; });
   var year = main.first_air_date ? parseInt(String(main.first_air_date).slice(0, 4), 10) : null;
-  return { titles: latin, year: year };
+  var info = { titles: latin, year: year, seasonName: "", airDate: null };
+  // Fecha de estreno y nombre de la temporada (sirven para ubicar el arco en AniList)
+  try {
+    var sd = await fetch("https://api.themoviedb.org/3/tv/" + tmdbId + "/season/" + season + "?api_key=" + TMDB_API_KEY + "&language=en-US", { headers: { "User-Agent": UA } }).then(function (r) { return r.json(); });
+    if (sd && sd.success !== false) { info.airDate = sd.air_date || null; info.seasonName = sd.name || ""; }
+  } catch (e) { /* sin datos de temporada */ }
+  if (!info.airDate && season === 1) info.airDate = main.first_air_date || null;
+  return info;
+}
+function dateDays(str) {
+  var m = /^(\d{4})-(\d{2})-(\d{2})/.exec(String(str || ""));
+  return m ? Math.floor(Date.UTC(+m[1], +m[2] - 1, +m[3]) / 86400000) : null;
 }
 
 // ---------- similitud de titulos ----------
@@ -147,27 +159,90 @@ function bestSimilarity(text, titles) {
   return best;
 }
 
+// ---------- AniList: titulo romaji y titulo del arco ----------
+// El sitio usa el titulo romaji ("Ushiro no Shoumen Kamui-san") y a veces trata un arco como serie aparte
+// ("Tokyo Revengers: Santen Sensou-hen"). TMDB no da esos nombres; AniList si.
+// Devuelve { related: [nombres de entradas parecidas], arc: [nombres de la entrada que estrena en la fecha de la temporada] }
+async function getAniList(info) {
+  var out = { related: [], arc: [] };
+  var airDays = dateDays(info.airDate);
+  var query = "query ($search: String) { Page(page: 1, perPage: 15) { media(search: $search, type: ANIME, sort: SEARCH_MATCH) { title { romaji english } synonyms startDate { year month day } } } }";
+  var queries = info.titles.slice(0, 2);
+  for (var qi = 0; qi < queries.length; qi++) {
+    try {
+      var resp = await fetch("https://graphql.anilist.co", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+        body: JSON.stringify({ query: query, variables: { search: queries[qi] } })
+      });
+      if (!resp.ok) { trace("AniList HTTP " + resp.status); continue; }
+      var json = await resp.json();
+      var media = (json && json.data && json.data.Page && json.data.Page.media) || [];
+      var best = null, bestDiff = 1e9;
+      media.forEach(function (m) {
+        var names = [m.title && m.title.romaji, m.title && m.title.english].concat(m.synonyms || []).filter(Boolean);
+        var diff = 1e9;
+        var sd = m.startDate || {};
+        if (airDays !== null && sd.year) diff = Math.abs(Math.floor(Date.UTC(sd.year, (sd.month || 1) - 1, sd.day || 15) / 86400000) - airDays);
+        var related = names.some(function (n) { return info.titles.some(function (t) { return similarity(n, t) >= 0.5; }); }) || diff <= 7;
+        if (!related) return;
+        names.forEach(function (n) { if (slugify(n).length >= 2 && out.related.indexOf(n) === -1) out.related.push(n); });
+        if (diff < bestDiff) { bestDiff = diff; best = m; }
+      });
+      if (best && bestDiff <= 60) {
+        var arcNames = [best.title.romaji, best.title.english].concat((best.synonyms || []).filter(function (n) { return slugify(n).length >= 4; }).slice(0, 4)).filter(Boolean);
+        arcNames.forEach(function (n) { if (slugify(n).length >= 2 && out.arc.indexOf(n) === -1) out.arc.push(n); });
+        trace("AniList: entrada por fecha (" + bestDiff + " dias): " + (best.title.romaji || best.title.english));
+        break;
+      }
+      trace("AniList '" + queries[qi] + "': " + media.length + " resultados, ninguno estrena cerca de " + (info.airDate || "?"));
+    } catch (e) {
+      trace("AniList fallo: " + shortErr(e));
+    }
+  }
+  out.related = out.related.slice(0, 12);
+  return out;
+}
+
 // ---------- pagina del episodio ----------
-// Candidatos de slug. Forma vista: black-clover-temporada-2-ep-5. La de la temporada 1 es una suposicion.
-function episodeSlugs(titles, season, episode) {
+// Formas vistas en el sitio:
+//   black-clover-ep-1                          (temporada 1)
+//   black-clover-temporada-2-ep-5              (temporada 2 de la misma serie)
+//   tokyo-revengers-santen-sensou-hen-ep-8     (arco como serie aparte, sin "temporada")
+//   ushiro-no-shoumen-kamui-san-ep-1           (titulo romaji)
+function baseSlugsOf(info) {
   var bases = [];
-  titles.forEach(function (t) {
+  info.titles.forEach(function (t) {
     var b = slugify(stripSeasonWords(t));
     if (b && bases.indexOf(b) === -1) bases.push(b);
   });
+  return bases;
+}
+function episodeSlugs(info, season, episode, arc) {
+  var bases = baseSlugsOf(info);
   var out = [];
-  function add(s) { if (out.indexOf(s) === -1) out.push(s); }
-  bases.forEach(function (b) {
-    if (season > 1) {
+  function add(x) { if (x && out.indexOf(x) === -1) out.push(x); }
+  var arcSlugs = [];
+  function addArc(x) { if (x && x.length >= 4 && arcSlugs.indexOf(x) === -1) arcSlugs.push(x); }
+  (arc || []).forEach(function (t) { addArc(slugify(t)); });
+  // Nombre de la temporada en TMDB, si no es generico (ej. "Santen Sensou-hen")
+  var sn = info.seasonName;
+  if (sn && season > 1 && !/^(season|temporada|specials?|especiales?)\b/i.test(sn) && slugify(sn).length >= 4) {
+    bases.forEach(function (b) { addArc(slugify(b + " " + sn)); });
+  }
+  if (season > 1) {
+    // Con temporada mayor a 1, el titulo a secas seria la serie equivocada (temporada 1)
+    arcSlugs.forEach(function (sl) { if (bases.indexOf(sl) === -1) add(sl + "-ep-" + episode); });
+    bases.forEach(function (b) {
       add(b + "-temporada-" + season + "-ep-" + episode);
       add(b + "-" + season + "-ep-" + episode);
       add(b + "-season-" + season + "-ep-" + episode);
-    } else {
-      add(b + "-ep-" + episode);
-      add(b + "-temporada-1-ep-" + episode);
-    }
-  });
-  return out;
+    });
+  } else {
+    bases.forEach(function (b) { add(b + "-ep-" + episode); add(b + "-temporada-1-ep-" + episode); });
+    arcSlugs.forEach(function (sl) { add(sl + "-ep-" + episode); });
+  }
+  return out.slice(0, 16);
 }
 // Busca el iframe del reproductor: .../container.php?id=<ID>
 function findContainer(html) {
@@ -194,58 +269,103 @@ async function probeSlug(slug) {
     return { slug: slug, error: shortErr(e) };
   }
 }
-// Plan B: buscador del sitio (/?s=). Sin probar: no se sabe como devuelve los resultados.
-async function searchEpisode(titles, season, episode) {
-  var found = [];
-  for (var i = 0; i < Math.min(titles.length, 2); i++) {
-    var url = AD_BASE + "/?s=" + encodeURIComponent(titles[i]);
-    try {
-      var r = await fetchPage(url, { "Referer": AD_BASE + "/" });
-      var re = /href=["'](https?:\/\/animed23\.com\/capitulo\/([^"'\/?#]+)\/?)["']/gi, m;
-      var n = 0;
-      while ((m = re.exec(r.text))) {
-        n++;
-        var sm = /^(.*?)(?:-temporada-(\d+))?-ep-(\d+)$/.exec(m[2]);
-        if (!sm) continue;
-        var sSeason = sm[2] ? parseInt(sm[2], 10) : 1;
-        if (parseInt(sm[3], 10) !== episode || sSeason !== season) continue;
-        var sim = bestSimilarity(sm[1].replace(/-/g, " "), titles);
-        if (sim >= 0.8) found.push({ url: m[1], slug: m[2], sim: sim });
-      }
-      trace("busqueda /?s=" + titles[i] + ": HTTP " + r.status + ", " + n + " enlaces /capitulo/, " + found.length + " candidatos");
-    } catch (e) {
-      trace("busqueda /?s=" + titles[i] + " fallo: " + shortErr(e));
-    }
-  }
-  found.sort(function (a, b) { return b.sim - a.sim; });
-  return found;
-}
-async function findEpisodePage(info, season, episode) {
-  var slugs = episodeSlugs(info.titles, season, episode);
-  trace("slugs probables: " + slugs.join(", "));
+// Prueba una lista de slugs en paralelo y devuelve la primera pagina cuyo titulo coincide con la serie
+async function probeAll(slugs, verifyTitles, label) {
+  if (!slugs.length) return null;
+  trace(label + " slugs: " + slugs.join(", "));
   var probes = await Promise.all(slugs.map(probeSlug));
-  var withContainer = probes.filter(function (p) { return p.container; });
+  var n404 = 0, found = [];
   probes.forEach(function (p) {
-    if (p.container) trace("slug " + p.slug + ": HTTP " + p.status + ", iframe " + p.container.id);
+    if (p.container) { found.push(p); trace("slug " + p.slug + ": HTTP " + p.status + ", iframe " + p.container.id); }
     else if (p.blocked) trace("slug " + p.slug + ": bloqueado (Cloudflare) HTTP " + p.status);
     else if (p.error) trace("slug " + p.slug + ": fallo " + p.error);
+    else if (p.status === 404) n404++;
     else trace("slug " + p.slug + ": HTTP " + p.status + (p.noContainer ? " sin iframe container.php" : ""));
   });
-  // Verifica con el titulo de la pagina que sea la serie correcta
-  for (var i = 0; i < withContainer.length; i++) {
-    var t = pageTitle(withContainer[i].html);
-    var sim = bestSimilarity(cleanPageTitle(t), info.titles);
+  if (n404) trace(n404 + " slugs con HTTP 404");
+  for (var i = 0; i < found.length; i++) {
+    var t = pageTitle(found[i].html);
+    var sim = bestSimilarity(cleanPageTitle(t), verifyTitles);
     trace("titulo pagina '" + t + "' similitud " + sim.toFixed(2));
-    if (sim >= 0.6) return withContainer[i];
+    if (sim >= 0.6) return found[i];
   }
-  if (withContainer.length) {
-    trace("ninguna pagina coincide con el titulo; se usa la primera sin verificar");
-    return withContainer[0];
+  if (found.length) trace("hay paginas pero el titulo no coincide con la serie; se descartan");
+  return null;
+}
+// Respaldo: buscador del sitio (/?s=). Sus resultados enlazan a paginas de serie /anime/<slug>/
+async function searchSeriesSlugs(queries, matchTitles) {
+  var scored = {};
+  for (var i = 0; i < queries.length; i++) {
+    try {
+      var r = await fetchPage(AD_BASE + "/?s=" + encodeURIComponent(queries[i]), { "Referer": AD_BASE + "/" });
+      var re = /href=["'](?:https?:\/\/animed23\.com)?\/anime\/([a-z0-9][a-z0-9\-]*)\/?["']/gi, m, n = 0;
+      while ((m = re.exec(r.text))) {
+        n++;
+        var sim = bestSimilarity(m[1].replace(/-/g, " "), matchTitles);
+        if (sim >= 0.5 && (scored[m[1]] === undefined || sim > scored[m[1]])) scored[m[1]] = sim;
+      }
+      trace("busqueda /?s=" + queries[i] + ": HTTP " + r.status + ", " + n + " enlaces /anime/, " + Object.keys(scored).length + " series parecidas");
+    } catch (e) {
+      trace("busqueda /?s=" + queries[i] + " fallo: " + shortErr(e));
+    }
+    if (Object.keys(scored).length >= 3) break;
   }
-  var found = await searchEpisode(info.titles, season, episode);
-  for (var j = 0; j < found.length; j++) {
-    var p = await probeSlug(found[j].slug);
-    if (p.container) { trace("episodio hallado por busqueda: " + p.slug); return p; }
+  return Object.keys(scored).sort(function (a, b) { return scored[b] - scored[a]; }).slice(0, 3);
+}
+// Abre la pagina de la serie y busca el enlace /capitulo/<slug>-ep-N/
+async function episodeFromSeries(seriesSlug, season, episode, baseSlugs) {
+  try {
+    var r = await fetchPage(AD_BASE + "/anime/" + seriesSlug + "/", { "Referer": AD_BASE + "/" });
+    var re = /\/capitulo\/([a-z0-9][a-z0-9\-]*)\/?["'#?]/gi, m, links = [];
+    while ((m = re.exec(r.text))) { if (links.indexOf(m[1]) === -1) links.push(m[1]); }
+    trace("serie " + seriesSlug + ": HTTP " + r.status + ", " + links.length + " enlaces /capitulo/");
+    var isBase = baseSlugs.indexOf(seriesSlug) !== -1;
+    for (var i = 0; i < links.length; i++) {
+      var sm = /^(.*?)(?:-temporada-(\d+))?-ep-(\d+)$/.exec(links[i]);
+      if (!sm || parseInt(sm[3], 10) !== episode) continue;
+      var sSeason = sm[2] ? parseInt(sm[2], 10) : null;
+      if (season > 1) { if (sSeason === season || (sSeason === null && !isBase)) return links[i]; }
+      else if (sSeason === null || sSeason === 1) return links[i];
+    }
+  } catch (e) {
+    trace("serie " + seriesSlug + " fallo: " + shortErr(e));
+  }
+  return null;
+}
+async function findEpisodePage(info, season, episode) {
+  var tried = [];
+  function fresh(list) { var out = list.filter(function (x) { return tried.indexOf(x) === -1; }); tried = tried.concat(out); return out; }
+  var verifyTitles = info.titles.slice();
+
+  // 1) Slugs que salen de TMDB (rapido: sin consultar nada mas)
+  var page = await probeAll(fresh(episodeSlugs(info, season, episode, null)), verifyTitles, "TMDB");
+  if (page) return page;
+
+  // 2) Titulo romaji / del arco desde AniList
+  var al = await getAniList(info);
+  trace("AniList: " + al.related.length + " nombres relacionados; arco: " + (al.arc.join(" | ") || "ninguno"));
+  verifyTitles = verifyTitles.concat(al.arc);
+  var arcSlugs = fresh(episodeSlugs(info, season, episode, al.arc));
+  if (season === 1 && !al.arc.length) {
+    // Sin entrada por fecha: se prueban los nombres parecidos (la verificacion de titulo evita la serie equivocada)
+    al.related.slice(0, 4).forEach(function (n) {
+      var sl = slugify(n) + "-ep-" + episode;
+      if (tried.indexOf(sl) === -1) { tried.push(sl); arcSlugs.push(sl); }
+    });
+  }
+  page = await probeAll(arcSlugs, verifyTitles, "AniList");
+  if (page) return page;
+
+  // 3) Buscador del sitio -> pagina de la serie -> enlace del episodio
+  var queries = info.titles.slice(0, 2).concat(al.arc.slice(0, 2));
+  var series = await searchSeriesSlugs(queries, verifyTitles.concat(al.related.slice(0, 6)));
+  var bases = baseSlugsOf(info);
+  for (var i = 0; i < series.length; i++) {
+    var slug = await episodeFromSeries(series[i], season, episode, bases);
+    if (!slug || tried.indexOf(slug) !== -1) continue;
+    var p = await probeSlug(slug);
+    if (p.container) { trace("episodio hallado por la serie " + series[i] + ": " + slug); return p; }
+    trace("slug " + slug + " (de la serie " + series[i] + "): HTTP " + p.status + " sin iframe");
   }
   return null;
 }
@@ -441,9 +561,9 @@ async function core(tmdbId, type, season, episode) {
   }
   var s = parseInt(season, 10) || 1;
   var e = parseInt(episode, 10) || 1;
-  var info = await getTMDBInfo(tmdbId);
+  var info = await getTMDBInfo(tmdbId, s);
   if (!info || !info.titles.length) { trace("TMDB: sin datos para " + tmdbId); return []; }
-  trace("TMDB " + tmdbId + " T" + s + "E" + e + ": " + info.titles.join(" | "));
+  trace("TMDB " + tmdbId + " T" + s + "E" + e + ": " + info.titles.join(" | ") + " (temporada: " + (info.seasonName || "?") + ", estreno " + (info.airDate || "?") + ")");
 
   var page = await findEpisodePage(info, s, e);
   if (!page) { trace("no se encontro la pagina del episodio"); return []; }
@@ -474,7 +594,7 @@ async function core(tmdbId, type, season, episode) {
       var key = sourceKey(srv);
       if (!key) { trace(pl.lang + " " + srv.label + ": servidor desconocido (" + hostOf(srv.url) + ")"); return; }
       if (!ENABLED_SOURCES[key]) {
-        if (DEBUG && DUMP_SOURCES[key] && !DUMP_SOURCES["_done_" + key]) {
+        if (DEBUG && DUMP_SOURCES[key] && !(key === "Epsilon" && /peeplayer/.test(hostOf(srv.url))) && !DUMP_SOURCES["_done_" + key]) {
           DUMP_SOURCES["_done_" + key] = true; // un solo volcado por servidor
           jobs.push(withTimeout(dumpEmbed(srv, ctx), 15000, key).then(function () { return null; }, function (err) {
             trace(key + ": volcado fallo " + shortErr(err));
