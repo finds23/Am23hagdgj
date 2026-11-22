@@ -4,7 +4,8 @@
  *        -> iframe https://animed23.online/container.php?id=<ID>
  *        -> container.php?id=<ID>&open=1 (pantalla de idiomas) -> &lang=LAT|SUB|... (botones data-player-url)
  *        -> extractor por servidor.
- * Servidores vistos en el idioma LAT: Omega (mp4 en archive.org), Byse, MEGA, Epsilon, Abyss.
+ * Idiomas vistos: SUB, LAT, CAST. Servidores vistos en LAT/CAST: Byse, Omega (mp4 en archive.org), MEGA, Epsilon, Abyss.
+ * En SUB: Byse, Omega, MEGA, OK (ok.ru), Abyss. Nota: en SUB el Omega esta roto en la propia pagina del sitio (da 403), no es fallo del plugin.
  */
 if (typeof globalThis.setTimeout !== "function") {
   globalThis.setTimeout = function () { return 1; };
@@ -18,7 +19,8 @@ var MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; moto g82 5G) AppleWebKit/537.36
 
 // Activa/desactiva servidores. Nada de esto se ha probado todavia contra el sitio real.
 var ENABLED_SOURCES = {
-  Omega: true,     // mp4 directo en archive.org; sin probar que reproduce
+  Omega: true,     // mp4 directo en archive.org; PROBADO: reproduce (LAT). En SUB esta roto en el sitio
+  Okru: true,      // ok.ru (solo en SUB); extractor portado de animejara.js, sin probar
   Epsilon: false,  // peeplayer.com: sin extractor. Con DEBUG se vuelca su HTML para investigarlo
   Abyss: false,    // abyssplayer.com: sin extractor. Con DEBUG se vuelca su HTML para ver si responde con cabeceras de navegador
   Byse: false,     // bysesukior.com: descartado (antibot)
@@ -27,7 +29,7 @@ var ENABLED_SOURCES = {
 // Servidores sin extractor cuyo HTML se vuelca en pantalla cuando DEBUG esta activo
 var DUMP_SOURCES = { Epsilon: true, Abyss: true };
 
-var VERSION = "1.0.0"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.0.1"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true; // TEMPORAL: muestra el diagnostico. Poner en false cuando todo funcione.
 var DUMP_MAX = 30000; // maximo de caracteres por volcado
 var TRACE = [];
@@ -35,7 +37,7 @@ var DUMPS = [];
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 300)); }
 function dump(title, text) { DUMPS.push({ title: String(title), text: String(text || "") }); }
 
-var SERVER_ORDER = ["Omega", "Epsilon", "Abyss", "Byse", "MEGA"];
+var SERVER_ORDER = ["Omega", "Okru", "Epsilon", "Abyss", "Byse", "MEGA"];
 var LANG_ORDER = ["LAT", "CAST", "CAS", "ESP", "SUB"];
 var LANG_NAMES = { LAT: "Latino", CAST: "Castellano", CAS: "Castellano", ESP: "Castellano", SUB: "Subtitulado" };
 var LANG_FALLBACK = ["LAT", "SUB"]; // si la pantalla open=1 no deja ver los idiomas
@@ -55,8 +57,11 @@ function decodeEntities(s) {
 function shortErr(e) { return String(e && e.message || e).replace(/ en https?:\/\/\S+/, ""); }
 function hostOf(u) { var m = /^(?:https?:)?\/\/([^\/?#:]+)/i.exec(String(u || "")); return m ? m[1].toLowerCase() : "?"; }
 function originOf(u) { var m = /^(https?:\/\/[^\/?#]+)/i.exec(String(u || "")); return m ? m[1] : ""; }
-function looksBlocked(html) {
-  return /just a moment|cf-chl|challenge-platform|attention required|enable javascript and cookies/i.test(html || "");
+// Solo cuenta como bloqueo con HTTP 403/429/503 o con el texto del reto. (La pagina 404 normal trae scripts de Cloudflare y no es un bloqueo.)
+function looksBlocked(html, status) {
+  var txt = /just a moment|attention required|enable javascript and cookies/i.test(html || "");
+  if (txt) return true;
+  return (status === 403 || status === 429 || status === 503) && /cf-chl|challenge-platform|cloudflare/i.test(html || "");
 }
 function withTimeout(promise, ms, label) {
   return new Promise(function (resolve, reject) {
@@ -183,7 +188,7 @@ async function probeSlug(slug) {
     var r = await fetchPage(url, { "Referer": AD_BASE + "/" });
     var cont = findContainer(r.text);
     if (cont) return { url: url, slug: slug, html: r.text, container: cont, status: r.status };
-    if (looksBlocked(r.text)) return { blocked: true, slug: slug, status: r.status };
+    if (looksBlocked(r.text, r.status)) return { blocked: true, slug: slug, status: r.status };
     return { slug: slug, status: r.status, noContainer: r.ok };
   } catch (e) {
     return { slug: slug, error: shortErr(e) };
@@ -296,7 +301,7 @@ async function fetchLangPage(cont, lang, episodeUrl) {
         if (i > 0) trace(lang + ": servidores leidos con variante " + variants[i].tag);
         return servers;
       }
-      notes.push(variants[i].tag + " HTTP " + r.status + (looksBlocked(r.text) ? " bloqueado" : " sin botones"));
+      notes.push(variants[i].tag + " HTTP " + r.status + (looksBlocked(r.text, r.status) ? " bloqueado" : " sin botones"));
       if (i === variants.length - 1 || DEBUG) dump("container lang=" + lang + " (variante " + variants[i].tag + ", HTTP " + r.status + ")", r.text);
     } catch (e) {
       notes.push(variants[i].tag + " " + shortErr(e));
@@ -312,6 +317,7 @@ function sourceKey(s) {
   if (s.kind === "video" || /(^|\.)archive\.org$/.test(h)) return "Omega";
   if (/peeplayer/.test(h) || l === "epsilon") return "Epsilon";
   if (/abyss/.test(h) || l === "abyss") return "Abyss";
+  if (/(^|\.)ok\.ru$/.test(h) || l === "ok" || l === "okru") return "Okru";
   if (/byse|filemoon/.test(h) || l === "byse") return "Byse";
   if (/(^|\.)mega\.nz$/.test(h) || l === "mega") return "MEGA";
   return "";
@@ -342,25 +348,90 @@ async function extractDirect(srv, ctx) {
   }
   return { url: url, headers: headers, tag: "MP4" };
 }
-// Servidor sin extractor: solo vuelca su HTML en pantalla (DEBUG)
-async function dumpEmbed(srv, ctx) {
-  var r = await fetchPage(srv.url, browserHeaders(ctx.embedOrigin + "/"));
-  var html = r.text || "";
+// ---- Okru (portado de animejara.js; sin probar) ----
+function okDecode(t) {
+  return String(t || "").replace(/&quot;/g, '"').replace(/&#34;/g, '"').replace(/&#39;/g, "'").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+}
+var OK_QUALITY = ["mobile", "lowest", "low", "sd", "hd", "full", "quad", "ultra"];
+function parseOkru(html) {
+  var m = /data-options=(["'])([\s\S]*?)\1/.exec(html);
+  var meta = null;
+  if (m) {
+    try {
+      var opts = JSON.parse(okDecode(m[2]));
+      var raw = opts && opts.flashvars && opts.flashvars.metadata;
+      meta = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (e) { /* se prueba con regex */ }
+  }
+  var out = [];
+  if (meta) {
+    var hls = meta.hlsManifestUrl || meta.hlsMasterPlaylistUrl || meta.ondemandHls;
+    if (hls) out.push({ url: hls, type: "hls", tag: "HLS" });
+    var vids = (meta.videos || []).filter(function (v) { return v && v.url; });
+    vids.sort(function (a, b) { return OK_QUALITY.indexOf(b.name) - OK_QUALITY.indexOf(a.name); });
+    if (vids[0]) out.push({ url: vids[0].url, tag: "MP4 " + vids[0].name });
+    return out;
+  }
+  var txt = okDecode(html).replace(/\\u0026/g, "&").replace(/\\\//g, "/");
+  var hm = /"hlsManifestUrl"\s*:\s*"([^"]+)"/.exec(txt) || /"ondemandHls"\s*:\s*"([^"]+)"/.exec(txt);
+  if (hm) out.push({ url: hm[1], type: "hls", tag: "HLS" });
+  return out;
+}
+async function extractOkru(srv, ctx) {
+  var url = srv.url.indexOf("//") === 0 ? "https:" + srv.url : srv.url;
+  var r = await fetchPage(url, { "Referer": ctx.embedOrigin + "/" });
+  if (!r.ok) throw new Error("okru HTTP " + r.status);
+  var list = parseOkru(r.text);
+  if (!list.length) {
+    trace("okru: sin video; " + r.text.length + " caracteres, data-options=" + (/data-options=/.test(r.text) ? "si" : "no"));
+    throw new Error("okru: no se encontro el video");
+  }
+  return list.map(function (v) {
+    var o = { url: v.url, tag: v.tag, headers: { "Referer": "https://ok.ru/", "User-Agent": UA } };
+    if (v.type) o.type = v.type;
+    return o;
+  });
+}
+
+// ---- Volcado compacto de un servidor sin extractor (DEBUG) ----
+// Texto alrededor de las palabras clave que delatan de donde sale el enlace del video
+var DUMP_KEYS = /m3u8|\.mp4|["']?sources?["']?\s*[:=]|["']file["']\s*:|atob\(|eval\(|JSON\.parse|decrypt|crypto\.subtle|\bAES\b|fetch\(|\/api\//ig;
+function compactDump(html, status) {
   var src = [], inl = [], m;
   var reS = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
   while ((m = reS.exec(html))) {
     var sm = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(m[1]);
     if (sm) src.push(sm[1]); else if (m[2].trim().length > 20) inl.push(m[2]);
   }
-  var head = "HTTP " + r.status + " | " + html.length + " caracteres | bloqueado: " + (looksBlocked(html) ? "si" : "no") +
+  var out = "HTTP " + status + " | " + html.length + " car | bloqueado: " + (looksBlocked(html, status) ? "si" : "no") +
     "\ntitulo: " + pageTitle(html) +
-    "\nscripts externos: " + src.join(" , ") +
-    "\n--- scripts inline ---\n" + inl.join("\n/*-----*/\n") +
-    "\n--- inicio del HTML ---\n" + html.slice(0, 4000);
-  dump(srv.label + " " + srv.url, head);
+    "\nscripts externos (" + src.length + "): " + src.map(function (u) { return u.replace(/^https?:\/\//, ""); }).join(" , ") +
+    "\nscripts inline: " + inl.length + " (tamanos " + inl.map(function (x) { return x.length; }).join(",") + ")";
+  // Cadenas largas (posibles datos cifrados o codificados)
+  var longs = [], lm, reL = /["'`]([A-Za-z0-9+\/=_\-%\\.:{}",\[\]]{200,})["'`]/g;
+  var body = inl.join("\n");
+  while ((lm = reL.exec(body)) && longs.length < 5) longs.push(lm[1].length + " car: " + lm[1].slice(0, 100));
+  out += "\ncadenas largas en scripts inline (" + longs.length + "): " + longs.join(" || ");
+  // Contexto de palabras clave (HTML + scripts), sin repetir zonas
+  var hits = [], last = -1, km;
+  var all = html;
+  DUMP_KEYS.lastIndex = 0;
+  while ((km = DUMP_KEYS.exec(all)) && hits.length < 14) {
+    if (km.index < last) continue;
+    var a = Math.max(0, km.index - 120), b = Math.min(all.length, km.index + 200);
+    hits.push(all.slice(a, b).replace(/\s+/g, " ").replace(/[A-Za-z0-9+\/=_%-]{60,}/g, function (t) { return "<" + t.length + " car>"; }));
+    last = b;
+  }
+  out += "\n--- palabras clave (" + hits.length + ") ---\n" + hits.join("\n..\n");
+  return out;
+}
+async function dumpEmbed(srv, ctx) {
+  var r = await fetchPage(srv.url, browserHeaders(ctx.embedOrigin + "/"));
+  var html = r.text || "";
+  dump(srv.label + " " + srv.url, compactDump(html, r.status));
   trace(srv.label + ": volcado HTTP " + r.status + ", " + html.length + " caracteres");
 }
-var EXTRACTORS = { Omega: extractDirect };
+var EXTRACTORS = { Omega: extractDirect, Okru: extractOkru };
 
 // ---------- punto de entrada ----------
 async function core(tmdbId, type, season, episode) {
@@ -386,8 +457,7 @@ async function core(tmdbId, type, season, episode) {
     var openUrl = "https://" + cont.host + "/container.php?id=" + cont.id + "&open=1";
     var op = await fetchPage(openUrl, { "Referer": page.url });
     langs = parseLangs(op.text);
-    trace("open=1: HTTP " + op.status + ", idiomas: " + (langs.join(",") || "ninguno") + (looksBlocked(op.text) ? " (bloqueado)" : ""));
-    if (DEBUG) dump("container open=1 (HTTP " + op.status + ")", op.text);
+    trace("open=1: HTTP " + op.status + ", idiomas: " + (langs.join(",") || "ninguno") + (looksBlocked(op.text, op.status) ? " (bloqueado)" : ""));
   } catch (err) {
     trace("open=1 fallo: " + shortErr(err));
   }
@@ -415,18 +485,22 @@ async function core(tmdbId, type, season, episode) {
       }
       var fn = EXTRACTORS[key];
       if (!fn) return;
-      jobs.push(withTimeout(fn(srv, ctx), 15000, srv.label).then(function (v) {
+      jobs.push(withTimeout(Promise.resolve().then(function () { return fn(srv, ctx); }), 15000, srv.label).then(function (res) {
+        var list = Array.isArray(res) ? res : [res];
         var q = srv.quality || "HD";
-        return {
-          name: "AnimeD23",
-          title: "",
-          url: v.url,
-          quality: "\uD83D\uDCFA " + srv.label + " (" + v.tag + ")\n" + q + " | WEB-DL\n" + (LANG_NAMES[pl.lang] || pl.lang),
-          headers: v.headers,
-          type: v.type,
-          _lang: pl.lang,
-          _rank: SERVER_ORDER.indexOf(key)
-        };
+        return list.map(function (v) {
+          var o = {
+            name: "AnimeD23",
+            title: "",
+            url: v.url,
+            quality: "\uD83D\uDCFA " + srv.label + " (" + v.tag + ")\n" + q + " | WEB-DL\n" + (LANG_NAMES[pl.lang] || pl.lang),
+            headers: v.headers,
+            type: v.type,
+            _lang: pl.lang,
+            _rank: SERVER_ORDER.indexOf(key)
+          };
+          return o;
+        });
       }, function (err) {
         trace(srv.label + " (" + pl.lang + ") fallo: " + shortErr(err));
         return null;
@@ -434,7 +508,8 @@ async function core(tmdbId, type, season, episode) {
     });
   });
   var done = await Promise.all(jobs);
-  var results = done.filter(Boolean);
+  var results = [];
+  done.filter(Boolean).forEach(function (arr) { results = results.concat(arr); });
 
   // Quita duplicados por URL y ordena: idioma LAT -> CAST -> SUB, luego servidor
   var seen = {};
