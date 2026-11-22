@@ -1,12 +1,12 @@
 {
   "name": "am23s",
-  "version": "1.3",
+  "version": "1.4",
   "scrapers": [
     {
       "id": "Am23",
       "name": "AnimeJara",
       "description": "St.",
-      "version": "1.3",
+      "version": "1.4",
       "author": "-",
       "supportedTypes": ["tv"],
       "filename": "providers/am23.js",
