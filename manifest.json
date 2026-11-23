@@ -1,12 +1,12 @@
 {
-  "name": "am23s",
-  "version": "1.6",
+  "name": "am23ss",
+  "version": "1.7",
   "scrapers": [
     {
       "id": "Am23",
       "name": "Am23",
       "description": "St.",
-      "version": "1.6",
+      "version": "1.7",
       "author": "-",
       "supportedTypes": ["tv"],
       "filename": "providers/am23.js",
