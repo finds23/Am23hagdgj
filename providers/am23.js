@@ -7,6 +7,10 @@
  * Slugs: ver baseSlugsOf/episodeSlugs (AniList da el titulo romaji y el del arco; /?s= y la pagina de la serie son el respaldo).
  * Idiomas vistos: SUB, LAT, CAST. Servidores vistos en LAT/CAST: Byse, Omega (mp4 en archive.org), MEGA, Epsilon, Abyss.
  * En SUB: Byse, Omega, MEGA, OK (ok.ru), Abyss. Nota: en SUB el Omega esta roto en la propia pagina del sitio (da 403), no es fallo del plugin.
+ *
+ * v1.0.3: si la pagina del episodio existe (HTTP 200) pero NO trae el iframe container.php (caso: Tsuihou sareta Tensei Juukishi ep. 1),
+ *         el diagnostico vuelca los iframes, los atributos data-*, los scripts y las palabras clave del reproductor para ver que
+ *         formato usa esa pagina. Tambien muestra una muestra de los enlaces /capitulo/ de la pagina de la serie.
  */
 if (typeof globalThis.setTimeout !== "function") {
   globalThis.setTimeout = function () { return 1; };
@@ -31,11 +35,12 @@ var ENABLED_SOURCES = {
 // Epsilon solo se vuelca si NO es peeplayer.com (ese ya se conoce)
 var DUMP_SOURCES = { Epsilon: true, Abyss: false };
 
-var VERSION = "1.0.2"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var VERSION = "1.0.3"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
 var DEBUG = true; // TEMPORAL: muestra el diagnostico. Poner en false cuando todo funcione.
 var DUMP_MAX = 30000; // maximo de caracteres por volcado
 var TRACE = [];
 var DUMPS = [];
+var PAGE_DUMPED = false; // un solo volcado de pagina sin container.php por ejecucion
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 300)); }
 function dump(title, text) { DUMPS.push({ title: String(title), text: String(text || "") }); }
 
@@ -264,11 +269,54 @@ async function probeSlug(slug) {
     var cont = findContainer(r.text);
     if (cont) return { url: url, slug: slug, html: r.text, container: cont, status: r.status };
     if (looksBlocked(r.text, r.status)) return { blocked: true, slug: slug, status: r.status };
-    return { slug: slug, status: r.status, noContainer: r.ok };
+    // v1.0.3: se conserva el HTML para poder volcarlo si la pagina existe pero no trae container.php
+    return { url: url, slug: slug, status: r.status, noContainer: r.ok, html: r.ok ? r.text : "" };
   } catch (e) {
     return { slug: slug, error: shortErr(e) };
   }
 }
+
+// ---- Volcado de una pagina de episodio SIN container.php (v1.0.3) ----
+// Muestra todo lo que pueda delatar donde esta el reproductor: iframes, atributos data-*, scripts y palabras clave.
+function dumpEpisodePage(p, title) {
+  var html = p.html || "";
+  var out = "URL: " + p.url + "\nHTTP " + p.status + " | " + html.length + " car | titulo: " + title;
+
+  // 1) iframes completos
+  var ifr = [], m, reI = /<iframe\b[^>]*>/gi;
+  while ((m = reI.exec(html)) && ifr.length < 12) ifr.push(m[0].replace(/\s+/g, " ").slice(0, 400));
+  out += "\n\n--- IFRAMES (" + ifr.length + ") ---\n" + (ifr.join("\n") || "(ninguno en el HTML)");
+
+  // 2) etiquetas con atributos que suelen llevar el enlace del reproductor
+  var tags = [], reT = /<(?:button|a|li|div|span|option|video|source|embed|object)\b[^>]*\b(?:data-player[\w-]*|data-src|data-embed[\w-]*|data-url|data-video|data-iframe|data-link|data-server|data-lang|data-id|data-post|data-nume|data-type)\s*=[^>]*>/gi;
+  while ((m = reT.exec(html)) && tags.length < 25) tags.push(m[0].replace(/\s+/g, " ").slice(0, 350));
+  out += "\n\n--- ETIQUETAS CON data-* (" + tags.length + ") ---\n" + (tags.join("\n") || "(ninguna)");
+
+  // 3) scripts externos e inline
+  var src = [], inl = [], reS = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  while ((m = reS.exec(html))) {
+    var sm = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(m[1]);
+    if (sm) src.push(sm[1].replace(/^https?:\/\//, "").slice(0, 160));
+    else if (m[2].trim().length > 20) inl.push(m[2]);
+  }
+  var own = src.filter(function (u) { return /animed23/i.test(u) && !/wp-includes|jquery|wp-emoji/i.test(u); });
+  out += "\n\n--- SCRIPTS EXTERNOS (" + src.length + "; del sitio: " + own.length + ") ---\n" + own.join("\n");
+  out += "\n\n--- SCRIPTS INLINE: " + inl.length + " (tamanos " + inl.map(function (x) { return x.length; }).join(",") + ") ---";
+
+  // 4) palabras clave con su contexto (sin repetir zonas)
+  var KEYS = /container\.php|embed|player|reproductor|okru|ok\.ru|archive\.org|mp4upload|streamwish|voe\.sx|filemoon|byse|abyss|peeplayer|admin-ajax|wp-json|\/api\/|data-player|iframe|video-url|videoUrl|servers?\b/ig;
+  var hits = [], last = -1, km;
+  KEYS.lastIndex = 0;
+  while ((km = KEYS.exec(html)) && hits.length < 40) {
+    if (km.index < last) continue;
+    var a = Math.max(0, km.index - 100), b = Math.min(html.length, km.index + 260);
+    hits.push(html.slice(a, b).replace(/\s+/g, " ").replace(/[A-Za-z0-9+\/=_%-]{80,}/g, function (t) { return "<" + t.length + " car>"; }));
+    last = b;
+  }
+  out += "\n\n--- PALABRAS CLAVE (" + hits.length + ") ---\n" + hits.join("\n..\n");
+  dump("pagina sin container.php: " + p.slug, out);
+}
+
 // Prueba una lista de slugs en paralelo y devuelve la primera pagina cuyo titulo coincide con la serie
 async function probeAll(slugs, verifyTitles, label) {
   if (!slugs.length) return null;
@@ -290,6 +338,21 @@ async function probeAll(slugs, verifyTitles, label) {
     if (sim >= 0.6) return found[i];
   }
   if (found.length) trace("hay paginas pero el titulo no coincide con la serie; se descartan");
+  // v1.0.3: paginas que existen pero no traen container.php -> volcar la primera cuyo titulo coincida
+  if (DEBUG && !PAGE_DUMPED) {
+    for (var j = 0; j < probes.length; j++) {
+      var pp = probes[j];
+      if (!pp.noContainer || !pp.html) continue;
+      var tt = pageTitle(pp.html);
+      var ss = bestSimilarity(cleanPageTitle(tt), verifyTitles);
+      trace("pagina sin container.php: '" + tt + "' similitud " + ss.toFixed(2));
+      if (ss >= 0.6) {
+        PAGE_DUMPED = true;
+        dumpEpisodePage(pp, tt);
+        break;
+      }
+    }
+  }
   return null;
 }
 // Respaldo: buscador del sitio (/?s=). Sus resultados enlazan a paginas de serie /anime/<slug>/
@@ -319,6 +382,8 @@ async function episodeFromSeries(seriesSlug, season, episode, baseSlugs) {
     var re = /\/capitulo\/([a-z0-9][a-z0-9\-]*)\/?["'#?]/gi, m, links = [];
     while ((m = re.exec(r.text))) { if (links.indexOf(m[1]) === -1) links.push(m[1]); }
     trace("serie " + seriesSlug + ": HTTP " + r.status + ", " + links.length + " enlaces /capitulo/");
+    // v1.0.3: muestra de los enlaces para ver como se llaman los episodios de esta serie
+    if (links.length) trace("muestra /capitulo/: " + links.slice(0, 4).join(" , ") + (links.length > 4 ? " ... " + links[links.length - 1] : ""));
     var isBase = baseSlugs.indexOf(seriesSlug) !== -1;
     for (var i = 0; i < links.length; i++) {
       var sm = /^(.*?)(?:-temporada-(\d+))?-ep-(\d+)$/.exec(links[i]);
@@ -649,6 +714,7 @@ async function core(tmdbId, type, season, episode) {
 async function getStreams(tmdbId, type, season, episode) {
   TRACE = [];
   DUMPS = [];
+  PAGE_DUMPED = false;
   DUMP_SOURCES._done_Epsilon = false;
   DUMP_SOURCES._done_Abyss = false;
   var results = [];
