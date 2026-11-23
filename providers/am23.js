@@ -7,12 +7,6 @@
  * Slugs: ver baseSlugsOf/episodeSlugs (AniList da el titulo romaji y el del arco; /?s= y la pagina de la serie son el respaldo).
  * Idiomas vistos: SUB, LAT, CAST. Servidores vistos en LAT/CAST: Byse, Omega (mp4 en archive.org), MEGA, Epsilon, Abyss.
  * En SUB: Byse, Omega, MEGA, OK (ok.ru), Abyss. Nota: en SUB el Omega esta roto en la propia pagina del sitio (da 403), no es fallo del plugin.
- *
- * v1.0.3: si la pagina del episodio existe (HTTP 200) pero NO trae el iframe container.php (caso: Tsuihou sareta Tensei Juukishi ep. 1),
- *         el diagnostico vuelca los iframes, los atributos data-*, los scripts y las palabras clave del reproductor para ver que
- *         formato usa esa pagina. Tambien muestra una muestra de los enlaces /capitulo/ de la pagina de la serie.
- * v1.0.4: algunas paginas (animes nuevos) traen otro iframe: https://animed23.online/opciones/options.php?server=multi&value=<base64>.<firma>
- *         En ese caso se descarga esa pagina y se leen los botones data-player-url. Si la pagina trae container.php se usa el flujo de siempre.
  */
 if (typeof globalThis.setTimeout !== "function") {
   globalThis.setTimeout = function () { return 1; };
@@ -37,12 +31,11 @@ var ENABLED_SOURCES = {
 // Epsilon solo se vuelca si NO es peeplayer.com (ese ya se conoce)
 var DUMP_SOURCES = { Epsilon: true, Abyss: false };
 
-var VERSION = "1.0.4"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
-var DEBUG = true; // TEMPORAL: muestra el diagnostico. Poner en false cuando todo funcione.
+var VERSION = "1.0.2"; // se muestra en el diagnostico para saber que copia del plugin esta cargando Nuvio
+var DEBUG = false; // diagnostico apagado. Poner en true para ver el diagnostico en pantalla.
 var DUMP_MAX = 30000; // maximo de caracteres por volcado
 var TRACE = [];
 var DUMPS = [];
-var PAGE_DUMPED = false; // un solo volcado de pagina sin container.php por ejecucion
 function trace(msg) { TRACE.push(String(msg).replace(/\s+/g, " ").slice(0, 300)); }
 function dump(title, text) { DUMPS.push({ title: String(title), text: String(text || "") }); }
 
@@ -256,33 +249,6 @@ function findContainer(html) {
   var m = /(?:https?:)?(?:\\?\/){2}([a-z0-9.-]+)(?:\\?\/)container\.php\?id=([A-Za-z0-9_-]+)/i.exec(html || "");
   return m ? { host: m[1].toLowerCase(), id: m[2] } : null;
 }
-// v1.0.4: iframe alterno .../opciones/options.php?server=multi&value=<base64>.<firma>&bg=...
-function findOptions(html) {
-  var m = /<iframe\b[^>]*\bsrc\s*=\s*["']([^"']*\/opciones\/options\.php[^"']*)["']/i.exec(html || "");
-  if (!m) return "";
-  var u = decodeEntities(m[1]);
-  if (u.indexOf("//") === 0) u = "https:" + u;
-  return u;
-}
-function b64decode(s) {
-  var chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  var str = String(s || "").replace(/-/g, "+").replace(/_/g, "/").replace(/[^A-Za-z0-9+\/]/g, "");
-  var out = "", bits = 0, val = 0;
-  for (var i = 0; i < str.length; i++) {
-    val = ((val << 6) | chars.indexOf(str.charAt(i))) & 0xFFFF;
-    bits += 6;
-    if (bits >= 8) { bits -= 8; out += String.fromCharCode((val >> bits) & 255); }
-  }
-  return out;
-}
-// value=<base64 de un JSON {"sub":..,"lat":..,"cast":..,"rc":..}>.<firma>
-function decodeOptionsValue(u) {
-  var m = /[?&]value=([^&]+)/.exec(u || "");
-  if (!m) return null;
-  var v = m[1];
-  try { v = decodeURIComponent(v); } catch (_) { /* se usa tal cual */ }
-  try { return JSON.parse(b64decode(v.split(".")[0])); } catch (_) { return null; }
-}
 function pageTitle(html) {
   var m = /<title[^>]*>([^<]*)<\/title>/i.exec(html || "");
   return m ? decodeEntities(m[1]).trim() : "";
@@ -297,57 +263,12 @@ async function probeSlug(slug) {
     var r = await fetchPage(url, { "Referer": AD_BASE + "/" });
     var cont = findContainer(r.text);
     if (cont) return { url: url, slug: slug, html: r.text, container: cont, status: r.status };
-    var opt = findOptions(r.text);
-    if (opt) return { url: url, slug: slug, html: r.text, optionsUrl: opt, status: r.status };
     if (looksBlocked(r.text, r.status)) return { blocked: true, slug: slug, status: r.status };
-    // v1.0.3: se conserva el HTML para poder volcarlo si la pagina existe pero no trae container.php
-    return { url: url, slug: slug, status: r.status, noContainer: r.ok, html: r.ok ? r.text : "" };
+    return { slug: slug, status: r.status, noContainer: r.ok };
   } catch (e) {
     return { slug: slug, error: shortErr(e) };
   }
 }
-
-// ---- Volcado de una pagina de episodio SIN container.php (v1.0.3) ----
-// Muestra todo lo que pueda delatar donde esta el reproductor: iframes, atributos data-*, scripts y palabras clave.
-function dumpEpisodePage(p, title) {
-  var html = p.html || "";
-  var out = "URL: " + p.url + "\nHTTP " + p.status + " | " + html.length + " car | titulo: " + title;
-
-  // 1) iframes completos
-  var ifr = [], m, reI = /<iframe\b[^>]*>/gi;
-  while ((m = reI.exec(html)) && ifr.length < 12) ifr.push(m[0].replace(/\s+/g, " ").slice(0, 400));
-  out += "\n\n--- IFRAMES (" + ifr.length + ") ---\n" + (ifr.join("\n") || "(ninguno en el HTML)");
-
-  // 2) etiquetas con atributos que suelen llevar el enlace del reproductor
-  var tags = [], reT = /<(?:button|a|li|div|span|option|video|source|embed|object)\b[^>]*\b(?:data-player[\w-]*|data-src|data-embed[\w-]*|data-url|data-video|data-iframe|data-link|data-server|data-lang|data-id|data-post|data-nume|data-type)\s*=[^>]*>/gi;
-  while ((m = reT.exec(html)) && tags.length < 25) tags.push(m[0].replace(/\s+/g, " ").slice(0, 350));
-  out += "\n\n--- ETIQUETAS CON data-* (" + tags.length + ") ---\n" + (tags.join("\n") || "(ninguna)");
-
-  // 3) scripts externos e inline
-  var src = [], inl = [], reS = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
-  while ((m = reS.exec(html))) {
-    var sm = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(m[1]);
-    if (sm) src.push(sm[1].replace(/^https?:\/\//, "").slice(0, 160));
-    else if (m[2].trim().length > 20) inl.push(m[2]);
-  }
-  var own = src.filter(function (u) { return /animed23/i.test(u) && !/wp-includes|jquery|wp-emoji/i.test(u); });
-  out += "\n\n--- SCRIPTS EXTERNOS (" + src.length + "; del sitio: " + own.length + ") ---\n" + own.join("\n");
-  out += "\n\n--- SCRIPTS INLINE: " + inl.length + " (tamanos " + inl.map(function (x) { return x.length; }).join(",") + ") ---";
-
-  // 4) palabras clave con su contexto (sin repetir zonas)
-  var KEYS = /container\.php|embed|player|reproductor|okru|ok\.ru|archive\.org|mp4upload|streamwish|voe\.sx|filemoon|byse|abyss|peeplayer|admin-ajax|wp-json|\/api\/|data-player|iframe|video-url|videoUrl|servers?\b/ig;
-  var hits = [], last = -1, km;
-  KEYS.lastIndex = 0;
-  while ((km = KEYS.exec(html)) && hits.length < 40) {
-    if (km.index < last) continue;
-    var a = Math.max(0, km.index - 100), b = Math.min(html.length, km.index + 260);
-    hits.push(html.slice(a, b).replace(/\s+/g, " ").replace(/[A-Za-z0-9+\/=_%-]{80,}/g, function (t) { return "<" + t.length + " car>"; }));
-    last = b;
-  }
-  out += "\n\n--- PALABRAS CLAVE (" + hits.length + ") ---\n" + hits.join("\n..\n");
-  dump("pagina sin container.php: " + p.slug, out);
-}
-
 // Prueba una lista de slugs en paralelo y devuelve la primera pagina cuyo titulo coincide con la serie
 async function probeAll(slugs, verifyTitles, label) {
   if (!slugs.length) return null;
@@ -356,7 +277,6 @@ async function probeAll(slugs, verifyTitles, label) {
   var n404 = 0, found = [];
   probes.forEach(function (p) {
     if (p.container) { found.push(p); trace("slug " + p.slug + ": HTTP " + p.status + ", iframe " + p.container.id); }
-    else if (p.optionsUrl) { found.push(p); trace("slug " + p.slug + ": HTTP " + p.status + ", iframe options.php"); }
     else if (p.blocked) trace("slug " + p.slug + ": bloqueado (Cloudflare) HTTP " + p.status);
     else if (p.error) trace("slug " + p.slug + ": fallo " + p.error);
     else if (p.status === 404) n404++;
@@ -370,21 +290,6 @@ async function probeAll(slugs, verifyTitles, label) {
     if (sim >= 0.6) return found[i];
   }
   if (found.length) trace("hay paginas pero el titulo no coincide con la serie; se descartan");
-  // v1.0.3: paginas que existen pero no traen container.php -> volcar la primera cuyo titulo coincida
-  if (DEBUG && !PAGE_DUMPED) {
-    for (var j = 0; j < probes.length; j++) {
-      var pp = probes[j];
-      if (!pp.noContainer || !pp.html) continue;
-      var tt = pageTitle(pp.html);
-      var ss = bestSimilarity(cleanPageTitle(tt), verifyTitles);
-      trace("pagina sin container.php: '" + tt + "' similitud " + ss.toFixed(2));
-      if (ss >= 0.6) {
-        PAGE_DUMPED = true;
-        dumpEpisodePage(pp, tt);
-        break;
-      }
-    }
-  }
   return null;
 }
 // Respaldo: buscador del sitio (/?s=). Sus resultados enlazan a paginas de serie /anime/<slug>/
@@ -414,8 +319,6 @@ async function episodeFromSeries(seriesSlug, season, episode, baseSlugs) {
     var re = /\/capitulo\/([a-z0-9][a-z0-9\-]*)\/?["'#?]/gi, m, links = [];
     while ((m = re.exec(r.text))) { if (links.indexOf(m[1]) === -1) links.push(m[1]); }
     trace("serie " + seriesSlug + ": HTTP " + r.status + ", " + links.length + " enlaces /capitulo/");
-    // v1.0.3: muestra de los enlaces para ver como se llaman los episodios de esta serie
-    if (links.length) trace("muestra /capitulo/: " + links.slice(0, 4).join(" , ") + (links.length > 4 ? " ... " + links[links.length - 1] : ""));
     var isBase = baseSlugs.indexOf(seriesSlug) !== -1;
     for (var i = 0; i < links.length; i++) {
       var sm = /^(.*?)(?:-temporada-(\d+))?-ep-(\d+)$/.exec(links[i]);
@@ -461,7 +364,7 @@ async function findEpisodePage(info, season, episode) {
     var slug = await episodeFromSeries(series[i], season, episode, bases);
     if (!slug || tried.indexOf(slug) !== -1) continue;
     var p = await probeSlug(slug);
-    if (p.container || p.optionsUrl) { trace("episodio hallado por la serie " + series[i] + ": " + slug); return p; }
+    if (p.container) { trace("episodio hallado por la serie " + series[i] + ": " + slug); return p; }
     trace("slug " + slug + " (de la serie " + series[i] + "): HTTP " + p.status + " sin iframe");
   }
   return null;
@@ -650,88 +553,6 @@ async function dumpEmbed(srv, ctx) {
 }
 var EXTRACTORS = { Omega: extractDirect, Okru: extractOkru };
 
-// ---------- camino options.php (v1.0.4) ----------
-// Igual que parseServers pero acepta cualquier etiqueta con data-player-url (no solo <button>)
-function parseServersLoose(html) {
-  var out = [], seen = {};
-  var re = /<[a-z][a-z0-9]*\b[^>]*\bdata-player-url\s*=[^>]*>/gi, m;
-  while ((m = re.exec(html || ""))) {
-    var tag = m[0];
-    var url = attr(tag, "data-player-url");
-    if (!url || seen[url]) continue;
-    seen[url] = true;
-    var q = /(\d{3,4})p/i.exec(attr(tag, "title"));
-    out.push({
-      url: url,
-      kind: attr(tag, "data-player-kind") || "iframe",
-      label: attr(tag, "data-player-label") || hostOf(url),
-      quality: q ? q[1] + "p" : ""
-    });
-  }
-  return out;
-}
-var VALUE_LANGS = [["lat", "LAT"], ["cast", "CAST"], ["sub", "SUB"]];
-async function coreOptions(page) {
-  var optUrl = page.optionsUrl;
-  var ctx = { embedOrigin: originOf(optUrl) };
-  trace("options.php: " + optUrl.replace(/value=[^&]+/, "value=<...>").slice(0, 200));
-
-  // El value trae un JSON con los idiomas disponibles
-  var val = decodeOptionsValue(optUrl);
-  var langsV = [];
-  if (val) {
-    VALUE_LANGS.forEach(function (p) { if (val[p[0]]) langsV.push(p[1]); });
-    trace("options value: campos " + Object.keys(val).join(",") + "; idiomas con dato: " + (langsV.join(",") || "ninguno"));
-  } else {
-    trace("options value: no se pudo leer el JSON");
-  }
-
-  // Un iframe con referrerpolicy strict-when-cross-origin manda solo el origen del sitio: se prueba primero ese Referer
-  var variants = [
-    { tag: "A", headers: { "Referer": AD_BASE + "/" } },
-    { tag: "B", headers: { "Referer": page.url } },
-    { tag: "C", headers: {} }
-  ];
-  var html = "", status = 0, servers = [], notes = [];
-  for (var i = 0; i < variants.length; i++) {
-    try {
-      var r = await fetchPage(optUrl, variants[i].headers);
-      var sv = parseServersLoose(r.text);
-      notes.push(variants[i].tag + " HTTP " + r.status + (sv.length ? " " + sv.length + " botones" : (looksBlocked(r.text, r.status) ? " bloqueado" : " sin botones")));
-      if (!html || r.text.length > html.length) { html = r.text; status = r.status; }
-      if (sv.length) { servers = sv; if (i > 0) trace("options: servidores leidos con variante " + variants[i].tag); break; }
-    } catch (e) {
-      notes.push(variants[i].tag + " " + shortErr(e));
-    }
-  }
-
-  var perLang = [];
-  var langsP = parseLangs(html);
-  if (servers.length) {
-    // Sin pantalla de idiomas en la pagina: se usa el idioma que marca el value
-    perLang.push({ lang: langsV.length === 1 ? langsV[0] : (langsV[0] || "SUB"), servers: servers });
-  } else if (langsP.length) {
-    trace("options: sin botones, pero hay enlaces lang=" + langsP.join(","));
-    perLang = await Promise.all(langsP.map(function (lang) {
-      var u = optUrl + "&lang=" + lang;
-      return fetchPage(u, { "Referer": AD_BASE + "/" }).then(function (r) {
-        return { lang: lang, servers: parseServersLoose(r.text) };
-      }, function (e) {
-        trace("options lang=" + lang + " fallo: " + shortErr(e));
-        return { lang: lang, servers: [] };
-      });
-    }));
-  }
-  var total = 0;
-  perLang.forEach(function (pl) { total += pl.servers.length; });
-  if (!total) {
-    trace("options: sin servidores (" + notes.join("; ") + ")");
-    dump("options.php (HTTP " + status + ", " + html.length + " car)", html);
-    return [];
-  }
-  return await finishStreams(perLang, ctx);
-}
-
 // ---------- punto de entrada ----------
 async function core(tmdbId, type, season, episode) {
   if (type !== "tv") {
@@ -746,10 +567,6 @@ async function core(tmdbId, type, season, episode) {
 
   var page = await findEpisodePage(info, s, e);
   if (!page) { trace("no se encontro la pagina del episodio"); return []; }
-  if (page.optionsUrl) {
-    trace("pagina: " + page.url + " -> iframe options.php");
-    return await coreOptions(page);
-  }
   trace("pagina: " + page.url + " -> iframe " + page.container.host + " id " + page.container.id);
   var cont = page.container;
   var ctx = { embedOrigin: "https://" + cont.host };
@@ -770,18 +587,12 @@ async function core(tmdbId, type, season, episode) {
     return fetchLangPage(cont, lang, page.url).then(function (servers) { return { lang: lang, servers: servers }; });
   }));
 
-  return await finishStreams(perLang, ctx);
-}
-
-// Convierte los servidores leidos (por idioma) en streams: extractores en paralelo, sin duplicados y ordenados.
-// Lo usan los dos caminos (container.php y options.php).
-async function finishStreams(perLang, ctx) {
   var jobs = [];
   perLang.forEach(function (pl) {
     trace(pl.lang + ": " + pl.servers.length + " servidores (" + pl.servers.map(function (x) { return x.label; }).join(", ") + ")");
     pl.servers.forEach(function (srv) {
       var key = sourceKey(srv);
-      if (!key) { trace(pl.lang + " " + srv.label + ": servidor desconocido (" + srv.url.slice(0, 120) + ")"); return; }
+      if (!key) { trace(pl.lang + " " + srv.label + ": servidor desconocido (" + hostOf(srv.url) + ")"); return; }
       if (!ENABLED_SOURCES[key]) {
         if (DEBUG && DUMP_SOURCES[key] && !(key === "Epsilon" && /peeplayer/.test(hostOf(srv.url))) && !DUMP_SOURCES["_done_" + key]) {
           DUMP_SOURCES["_done_" + key] = true; // un solo volcado por servidor
@@ -838,7 +649,6 @@ async function finishStreams(perLang, ctx) {
 async function getStreams(tmdbId, type, season, episode) {
   TRACE = [];
   DUMPS = [];
-  PAGE_DUMPED = false;
   DUMP_SOURCES._done_Epsilon = false;
   DUMP_SOURCES._done_Abyss = false;
   var results = [];
@@ -849,7 +659,7 @@ async function getStreams(tmdbId, type, season, episode) {
     console.error("[AnimeD23] Error: " + shortErr(err));
   }
   console.log("[AnimeD23] " + results.length + " streams");
-  var failed = TRACE.some(function (t) { return /fallo|sin servidores|no se encontro|bloqueado|error|desconocido/.test(t); });
+  var failed = TRACE.some(function (t) { return /fallo|sin servidores|no se encontro|bloqueado|error/.test(t); });
   if (results.length === 0 || (DEBUG && (failed || DUMPS.length))) results = results.concat(diagnostic());
   return results;
 }
